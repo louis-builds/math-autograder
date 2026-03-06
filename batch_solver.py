@@ -17,6 +17,7 @@ dotenv.load_dotenv()
 # --- 1. Data Structure Definitions ---
 class ProblemEntry(BaseModel):
     page_number: int = Field(description="Page number")
+    question_number: str = Field(description="The question label or number (e.g., '1)', '2.', '3'). If none, leave empty.", default="")
     question_type: str = Field(description="Type of question: 'calculation', 'multiple_choice', 'true_false', or 'other'")
     expression: str = Field(description="If question_type is 'calculation', put the left-hand math formula to compute (e.g., '(1/2)+0.5'). For other types, leave empty.", default="")
     llm_answer: str = Field(description="If question_type is NOT 'calculation', the LLM should directly provide the concise answer here (e.g., 'A', 'True', '5 m'). For calculations, leave empty.", default="")
@@ -54,15 +55,16 @@ def parse_with_gemini_vision(images: list) -> List[ProblemEntry]:
         print(f"  Recognizing page {page_num}...")
         
         prompt = """You are a math and test expert. Exhaustively extract ALL questions from the image.
-        1. Classify each question using `question_type` ('calculation', 'multiple_choice', 'true_false', 'other').
-        2. If 'calculation': 
+        1. Extract the `question_number` if it exists as a prefix (e.g., '1)', '2.').
+        2. Classify each question using `question_type` ('calculation', 'multiple_choice', 'true_false', 'other').
+        3. If 'calculation': 
            - Convert columnar/text formats to standard math operators (+ - * /).
            - Output ONLY the left-hand side formula to `expression` (NO equals sign).
            - Convert fractions like '1 1/2' to '(1 + 1/2)'.
-        3. If 'multiple_choice', 'true_false', or 'other':
+        4. If 'multiple_choice', 'true_false', or 'other':
            - DO NOT put anything in `expression`.
            - Instead, directly answer the question yourself and put your final concise answer (e.g., 'A', 'True', '300 grams') into the `llm_answer` field.
-        4. Set `is_word_problem` to true for word problems, but false for plain variable substitutions like 'x+y'."""
+        5. Set `is_word_problem` to true for word problems, but false for plain variable substitutions like 'x+y'."""
 
         # --- Core: Use confirmed working model name ---
         # Add retry and slowdown logic
@@ -120,7 +122,8 @@ def calculate_and_save(problems: List[ProblemEntry], output_path: str):
         else:
             # If it's multiple choice or true/false, bypass eval() and show the LLM's answer directly
             ans = prob.llm_answer if prob.llm_answer else "(No answer extracted)"
-            display_text = f"Ans: {ans}"
+            prefix = prob.question_number + " " if prob.question_number else ""
+            display_text = f"{prefix}{ans}"
             
         results_map.setdefault(prob.page_number, []).append(display_text)
 
@@ -153,7 +156,12 @@ if __name__ == "__main__":
     print("-" * 80)
     for prob in extracted_data:
         word_tag = "✅" if prob.is_word_problem else "❌"
-        content = prob.expression if prob.question_type == 'calculation' else f"Ans: {prob.llm_answer}"
+        
+        if prob.question_type == 'calculation':
+            content = prob.expression
+        else:
+            content = f"{prob.question_number} {prob.llm_answer}"
+            
         # Truncate content if too long for preview
         if len(content) > 35:
             content = content[:32] + "..."
