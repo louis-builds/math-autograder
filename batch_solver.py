@@ -14,34 +14,36 @@ import dotenv
 # 加载 .env 里的 API Key
 dotenv.load_dotenv()
 
-# --- 1. 定义数据结构 ---
-class EquationEntry(BaseModel):
-    page_number: int = Field(description="页码")
-    expression: str = Field(description="算式，如 (1/2)+0.5 或 (1+3/4)*2")
-    is_word_problem: bool = Field(description="是否为需要逻辑理解的应用题")
+# --- 1. Data Structure Definitions ---
+class ProblemEntry(BaseModel):
+    page_number: int = Field(description="Page number")
+    question_type: str = Field(description="Type of question: 'calculation', 'multiple_choice', 'true_false', or 'other'")
+    expression: str = Field(description="If question_type is 'calculation', put the left-hand math formula to compute (e.g., '(1/2)+0.5'). For other types, leave empty.", default="")
+    llm_answer: str = Field(description="If question_type is NOT 'calculation', the LLM should directly provide the concise answer here (e.g., 'A', 'True', '5 m'). For calculations, leave empty.", default="")
+    is_word_problem: bool = Field(description="Whether this is a word problem that requires logical reading before calculating")
 
 class PaperStructure(BaseModel):
-    equations: List[EquationEntry]
+    problems: List[ProblemEntry]
 
-# --- 2. 视觉转换逻辑 (无需 poppler) ---
+# --- 2. Visual Conversion Logic (No poppler needed) ---
 def convert_pdf_to_images(pdf_path: str):
-    print(f"🚀 [1/4] 正在解析 PDF: {pdf_path}")
+    print(f"🚀 [1/4] Parsing PDF: {pdf_path}")
     try:
         doc = fitz.open(pdf_path)
         images = []
         for page in doc:
-            # 2.0 倍缩放确保 300DPI 左右的清晰度，方便识别微小的符号
+            # 2.0x scale ensures ~300DPI clarity for recognizing small symbols
             pix = page.get_pixmap(matrix=fitz.Matrix(2, 2))
             img_data = pix.tobytes("png")
             images.append(Image.open(io.BytesIO(img_data)))
         return images
     except Exception as e:
-        print(f"❌ 读取 PDF 失败: {e}")
+        print(f"❌ Failed to read PDF: {e}")
         sys.exit(1)
 
-# --- 3. Gemini 视觉识别核心 ---
-def parse_with_gemini_vision(images: list) -> List[EquationEntry]:
-    print(f"👁️ [2/4] 使用 Gemini 2.5 Flash 识别图片 (共 {len(images)} 页)...")
+# --- 3. Gemini Vision Parsing Core ---
+def parse_with_gemini_vision(images: list) -> List[ProblemEntry]:
+    print(f"👁️ [2/4] Using Gemini 2.5 Flash to recognize images ({len(images)} pages)...")
     
     api_key = os.environ.get("GEMINI_API_KEY")
     client = genai.Client(api_key=api_key)
@@ -49,106 +51,119 @@ def parse_with_gemini_vision(images: list) -> List[EquationEntry]:
 
     for i, img in enumerate(images):
         page_num = i + 1
-        print(f"  正在识别第 {page_num} 页...")
+        print(f"  Recognizing page {page_num}...")
         
-        prompt = """你是一个数学专家。请从图片中提取所有算式：
-        1. 竖式分数转为 (a/b)。
-        2. 只提取等号左侧。
-        3. 应用题 is_word_problem 设为 true。"""
+        prompt = """You are a math and test expert. Exhaustively extract ALL questions from the image.
+        1. Classify each question using `question_type` ('calculation', 'multiple_choice', 'true_false', 'other').
+        2. If 'calculation': 
+           - Convert columnar/text formats to standard math operators (+ - * /).
+           - Output ONLY the left-hand side formula to `expression` (NO equals sign).
+           - Convert fractions like '1 1/2' to '(1 + 1/2)'.
+        3. If 'multiple_choice', 'true_false', or 'other':
+           - DO NOT put anything in `expression`.
+           - Instead, directly answer the question yourself and put your final concise answer (e.g., 'A', 'True', '300 grams') into the `llm_answer` field.
+        4. Set `is_word_problem` to true for word problems, but false for plain variable substitutions like 'x+y'."""
 
-        # --- 核心：使用你确认可用的模型名 ---
-        # 加上重试和降速逻辑
+        # --- Core: Use confirmed working model name ---
+        # Add retry and slowdown logic
         for attempt in range(3):
             try:
                 response = client.models.generate_content(
-                    model='gemini-2.5-flash', # 回到你那个能跑通的模型
-                    contents=[prompt, img],    # 视觉模式：列表包含文字和图片
+                    model='gemini-2.5-flash', 
+                    contents=[prompt, img],
                     config={
                         'response_mime_type': 'application/json', 
                         'response_schema': PaperStructure
                     }
                 )
                 page_data = PaperStructure.model_validate_json(response.text)
-                for eq in page_data.equations:
-                    eq.page_number = page_num
-                    all_extracted_data.append(eq)
+                for prob in page_data.problems:
+                    prob.page_number = page_num
+                    all_extracted_data.append(prob)
                 
-                # 每成功一页，歇 5 秒（为了躲避 429 限制）
+                # Wait 5 seconds between pages to avoid 429 rate limits
                 time.sleep(5) 
                 break 
 
             except Exception as e:
                 error_str = str(e)
                 if "429" in error_str:
-                    print(f"  ⏳ 频率太快，强制等待 15 秒后重试...")
+                    print(f"  ⏳ Rate limit hit, waiting 15 seconds to retry...")
                     time.sleep(15)
                 elif "404" in error_str:
-                    # 如果 2.5 也报 404，尝试去掉开头的 models/ 或者加上它
-                    print(f"  ❌ 依然找不到模型，请检查 SDK 是否支持视觉输入。")
+                    print(f"  ❌ Model not found, please check SDK config.")
                     break
                 else:
-                    print(f"  ❌ 错误: {e}")
+                    print(f"  ❌ Error: {e}")
                     break
             
     return all_extracted_data
 
-# --- 4. 本地计算与 Word 导出 ---
-def calculate_and_save(equations, output_path):
-    print("🧮 [3/4] 正在计算答案...")
+# --- 4. Local Calculation & Word Export ---
+def calculate_and_save(problems: List[ProblemEntry], output_path: str):
+    print("🧮 [3/4] Processing answers...")
     doc = Document()
     doc.add_heading('Assessment Answers (NZ Year 4)', 0)
     
     results_map = {}
-    for eq in equations:
-        try:
-            # 清洗常见非数学字符并计算
-            exp_to_eval = eq.expression.replace('×','*').replace('÷','/')
-            val = eval(exp_to_eval)
-            # 格式化结果：去掉多余的 .0
-            ans = f"{val:.2f}".rstrip('0').rstrip('.')
-            display_text = f"{eq.expression} = {ans}" if eq.is_word_problem else ans
-        except:
-            display_text = f"{eq.expression} (?)"
+    for prob in problems:
+        if prob.question_type == 'calculation' and prob.expression:
+            try:
+                # Clean up common non-math chars and execute locally
+                exp_to_eval = prob.expression.replace('×','*').replace('÷','/')
+                val = eval(exp_to_eval)
+                # Format to remove trailing .0
+                ans = f"{val:.2f}".rstrip('0').rstrip('.')
+                display_text = f"{prob.expression} = {ans}" if prob.is_word_problem else ans
+            except:
+                display_text = f"{prob.expression} (?)"
+        else:
+            # If it's multiple choice or true/false, bypass eval() and show the LLM's answer directly
+            ans = prob.llm_answer if prob.llm_answer else "(No answer extracted)"
+            display_text = f"Ans: {ans}"
             
-        results_map.setdefault(eq.page_number, []).append(display_text)
+        results_map.setdefault(prob.page_number, []).append(display_text)
 
-    print(f"📝 [4/4] 正在写入 Word: {output_path}")
+    print(f"📝 [4/4] Writing to Word: {output_path}")
     for p_num in sorted(results_map.keys()):
         p = doc.add_paragraph()
         run = p.add_run(f"--- Page {p_num} ---")
         run.bold = True
         
-        # 紧凑排版：答案之间用分隔线隔开
+        # Dense layout: separate answers by pipes
         doc.add_paragraph("  |  ".join(results_map[p_num]))
         
     doc.save(output_path)
 
 if __name__ == "__main__":
     if len(sys.argv) < 2:
-        print("用法: python3 batch_solver.py <试卷PDF路径>")
+        print("Usage: python batch_solver.py <PDF_PATH>")
         sys.exit(1)
         
     input_pdf = sys.argv[1]
     output_docx = "math_answers_vision.docx"
     
-    # 执行流水线
+    # Execute pipeline
     img_list = convert_pdf_to_images(input_pdf)
     extracted_data = parse_with_gemini_vision(img_list)
 
-    # ✨ 新增：结果预览验证区
-    print("\n" + "="*50)
-    print(f"{'页码':<5} | {'提取的算式 (Expression)':<30} | {'应用题?'}")
-    print("-" * 50)
-    for eq in extracted_data:
-        word_tag = "✅" if eq.is_word_problem else "❌"
-        print(f"{eq.page_number:<5} | {eq.expression:<30} | {word_tag}")
-    print("="*50 + "\n")
+    # ✨ Preview Table
+    print("\n" + "="*80)
+    print(f"{'Page':<5} | {'Type':<15} | {'Expression/Content':<35} | {'App?'}")
+    print("-" * 80)
+    for prob in extracted_data:
+        word_tag = "✅" if prob.is_word_problem else "❌"
+        content = prob.expression if prob.question_type == 'calculation' else f"Ans: {prob.llm_answer}"
+        # Truncate content if too long for preview
+        if len(content) > 35:
+            content = content[:32] + "..."
+        print(f"{prob.page_number:<5} | {prob.question_type[:14]:<15} | {content:<35} | {word_tag}")
+    print("="*80 + "\n")
 
-    # 询问是否继续生成 Word
-    confirm = input("数据如上，是否生成 Word 答案文件？(y/n): ")
+    # Ask for confirmation before generating docx
+    confirm = input("Data mapped above. Generate Word document? (y/n): ")
     if confirm.lower() == 'y':
         calculate_and_save(extracted_data, output_docx)
+        print(f"\n✨ Success! Answers saved to: {output_docx}")
     else:
-        print("已取消导出。")
-    
-    print(f"\n✨ 大功告成！答案文件已生成：{output_docx}")
+        print("Export cancelled.")
